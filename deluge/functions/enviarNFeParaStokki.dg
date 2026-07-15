@@ -1,0 +1,118 @@
+// Zoho CRM - Custom Function (Deluge)
+// Envia a NF-e (XML) de uma venda faturada no Conta Azul para o Stokki (OMS),
+// usando o Supabase Storage como intermediário de hospedagem pública do arquivo.
+//
+// Fluxo:
+//   1. Baixa o XML da NF-e diretamente da API do Conta Azul, usando a chave de
+//      acesso da nota (44 dígitos).
+//   2. Faz upload desse XML para um bucket do Supabase Storage (upsert=true),
+//      obtendo uma URL pública para o arquivo.
+//   3. Envia essa URL, junto com a chave de acesso e o número do pedido ERP,
+//      para o endpoint de inbound de notas fiscais do Stokki (OMS), que usa o
+//      arquivo para vincular a NF-e ao pedido correspondente.
+//
+// ATENÇÃO - CREDENCIAIS:
+//   As chaves abaixo (SUPABASE_SERVICE_ROLE_KEY e STOKKI_TOKEN) foram REDIGIDAS
+//   nesta versão documentada. No Zoho, o ideal é buscá-las de uma Connection
+//   (zoho.crm ou zoho.extra via Connector) ou de uma variável de ambiente
+//   (Zoho Variables), nunca hardcoded na função.
+//   >>> Se as chaves originais chegaram a ser coladas em texto puro em algum
+//       lugar (chat, script salvo, etc.), rotacione-as (gere novas) no painel
+//       do Supabase e do Stokki, pois qualquer chave que circulou fora do
+//       Zoho deve ser considerada potencialmente comprometida.
+//
+// Dependências:
+//   - automation.renovarTokenContaAzul() : retorna access_token válido do Conta Azul
+//   - Bucket "nfe-xml" criado no Supabase Storage
+//   - Token de API do Stokki (subdomínio da conta: configurar em subdominioStokki)
+//
+// Parâmetros:
+//   chaveAcesso (String) - Chave de acesso da NF-e (44 dígitos)
+//   numberErp   (String) - Número do pedido no ERP, usado para vincular no Stokki
+//
+// Retorno: void (loga o resultado via `info`)
+
+void automation.enviarNFeParaStokki(String chaveAcesso,String numberErp)
+{
+// =====================================
+// 1. BAIXAR XML DA CONTA AZUL
+// =====================================
+accessToken = automation.renovarTokenContaAzul();
+headerContaAzul = Map();
+headerContaAzul.put("Authorization","Bearer " + accessToken);
+headerContaAzul.put("Accept","application/xml");
+urlXml = "https://api-v2.contaazul.com/v1/notas-fiscais/" + chaveAcesso;
+arquivoXml = invokeurl
+[
+	url :urlXml
+	type :GET
+	headers:headerContaAzul
+];
+if(arquivoXml == null)
+{
+	info "ERRO: A Conta Azul não retornou arquivo.";
+	return;
+}
+tamanhoArquivo = arquivoXml.getFileSize();
+if(tamanhoArquivo == null || tamanhoArquivo <= 0)
+{
+	info "ERRO: O arquivo XML está vazio.";
+	return;
+}
+nomeArquivo = chaveAcesso + ".xml";
+arquivoXml.setFileName(nomeArquivo);
+arquivoXml.setFileType("application/xml");
+// =====================================
+// 2. ENVIAR PARA O SUPABASE
+// =====================================
+supabaseUrl = "https://kxnrhpbzbiyvwnuluffe.supabase.co";
+serviceRoleKey = "{{SUPABASE_SERVICE_ROLE_KEY}}"; // REDIGIDO - buscar de Connection/Variável segura
+bucket = "nfe-xml";
+headerSupabase = Map();
+headerSupabase.put("apikey",serviceRoleKey);
+headerSupabase.put("Authorization","Bearer " + serviceRoleKey);
+headerSupabase.put("Content-Type","application/xml");
+headerSupabase.put("x-upsert","true");
+urlUpload = supabaseUrl + "/storage/v1/object/" + bucket + "/" + nomeArquivo;
+respostaUpload = invokeurl
+[
+	url :urlUpload
+	type :POST
+	body:arquivoXml
+	headers:headerSupabase
+	detailed:true
+];
+codigoUpload = respostaUpload.get("responseCode");
+if(codigoUpload != 200 && codigoUpload != 201)
+{
+	info "ERRO: Falha no upload para o Supabase.";
+	info respostaUpload;
+	return;
+}
+urlPublica = supabaseUrl + "/storage/v1/object/public/" + bucket + "/" + nomeArquivo;
+info "XML hospedado em:";
+info urlPublica;
+// =====================================
+// 3. ENVIAR PARA O STOKKI
+// =====================================
+tokenStokki = "{{STOKKI_TOKEN}}"; // REDIGIDO - buscar de Connection/Variável segura
+subdominioStokki = "novellohuaxin";
+// ex: suaempresa
+urlStokki = "https://" + subdominioStokki + ".stokki.com.br/api/stokki/oms/outbound/invoice";
+bodyStokki = Map();
+bodyStokki.put("token",tokenStokki);
+bodyStokki.put("number_erp",numberErp);
+bodyStokki.put("invoice",chaveAcesso);
+bodyStokki.put("file_url_invoice",urlPublica);
+headerStokki = Map();
+headerStokki.put("Content-Type","application/json");
+respostaStokki = invokeurl
+[
+	url :urlStokki
+	type :POST
+	parameters:bodyStokki.toString()
+	headers:headerStokki
+];
+info "Resposta do Stokki:";
+info respostaStokki;
+}

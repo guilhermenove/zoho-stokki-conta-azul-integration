@@ -1,0 +1,294 @@
+// Zoho CRM - Custom Function (Deluge)
+// Módulo: Deals
+// Cria uma Venda no Conta Azul a partir de um Deal do Zoho CRM.
+//
+// Fluxo:
+//   1. Verifica se o Deal já possui uma venda vinculada (campo Conta_Azul_Venda_Id)
+//      para evitar duplicidade.
+//   2. Renova o token de acesso do Conta Azul (ver automation.renovarTokenContaAzul).
+//   3. Busca a Account vinculada ao Deal e valida se o CNPJ está preenchido.
+//      - Se não tiver CNPJ: bloqueia a criação da venda, devolve o Deal para o
+//        estágio "Negotiation/Review" e envia e-mail de alerta.
+//   4. Busca o cliente no Conta Azul pelo CNPJ (documento). Se não existir, cria
+//      um novo cliente (pessoa jurídica) com os dados de endereço da Account.
+//   5. Percorre o subform de produtos do Deal (Produtos_API), localizando cada
+//      item no Conta Azul pelo SKU/código do produto (Product_Code no Zoho).
+//      - Produtos não encontrados no Conta Azul bloqueiam a venda e disparam
+//        e-mail de alerta.
+//   6. Monta as condições de pagamento (à vista ou parcelado, com base no campo
+//      Cond_Pagamento_Lista, ex: "30,60,90") calculando datas de vencimento e
+//      valores de cada parcela.
+//   7. Envia o payload da venda para a API do Conta Azul (POST /v1/venda).
+//   8. Em caso de sucesso, grava o ID da venda e o status no Deal.
+//      Em caso de erro, grava o erro no Deal, devolve o estágio e envia e-mail.
+//
+// Dependências:
+//   - automation.renovarTokenContaAzul() : função que retorna um access_token válido
+//   - Campos customizados no módulo Deals: Conta_Azul_Venda_Id, Produtos_API,
+//     Cond_Pagamento_Lista, Ordem_de_Compra, Transportadora, Frete,
+//     Unidade_de_Faturamento, Status_ContaAzul_Detalhe
+//   - Campos customizados no módulo Accounts: CNPJ, Billing_Code, Billing_Street,
+//     Bairro, Billing_City, Estado
+//   - Campo customizado no módulo Products: Product_Code (SKU usado no Conta Azul)
+//
+// Parâmetros:
+//   dealId (String) - ID do registro de Deal no Zoho CRM
+//
+// Retorno:
+//   String com o resultado da execução (sucesso, erro ou motivo de bloqueio)
+
+string automation.criarVendaContaAzul(String dealId)
+{
+resultadoFinal = "";
+try
+{
+	dealMap = zoho.crm.getRecordById("Deals",dealId);
+	vendaExistente = dealMap.get("Conta_Azul_Venda_Id");
+	if(vendaExistente != null && vendaExistente != "")
+	{
+		resultadoFinal = "Venda já criada anteriormente. Id: " + vendaExistente;
+	}
+	else
+	{
+		accessToken = automation.renovarTokenContaAzul();
+		headerMap = Map();
+		headerMap.put("Authorization","Bearer " + accessToken);
+		headerMap.put("Content-Type","application/json");
+		accountId = dealMap.get("Account_Name");
+		accountMap = zoho.crm.getRecordById("Accounts",accountId.get("id"));
+		// ===== BLOQUEIO: CNPJ ausente =====
+		cnpjOriginal = accountMap.get("CNPJ");
+		if(cnpjOriginal == null || cnpjOriginal.trim() == "")
+		{
+			mensagemErro = "❌ CNPJ NÃO CADASTRADO: a conta '" + accountMap.get("Account_Name") + "' não possui CNPJ preenchido. Venda NÃO criada no Conta Azul.";
+			mapaErro = Map();
+			mapaErro.put("Status_ContaAzul_Detalhe",mensagemErro);
+			mapaErro.put("Stage","Negotiation/Review");
+			zoho.crm.updateRecord("Deals",dealId,mapaErro);
+			sendmail
+			[
+				from :zoho.loginuserid
+				to :"importnovello@gmail.com"
+				subject :"Venda NÃO criada no Conta Azul - CNPJ ausente - " + dealMap.get("Deal_Name")
+				message :"A conta '" + accountMap.get("Account_Name") + "' vinculada ao negócio " + dealMap.get("Deal_Name") + " não possui CNPJ cadastrado.\n\nCadastre o CNPJ na Conta e reprocesse o negócio (edite qualquer campo e salve novamente). O negócio foi devolvido para o estágio anterior."
+			]
+			resultadoFinal = mensagemErro;
+		}
+		else
+		{
+			cnpjLimpo = cnpjOriginal.replaceAll("[^0-9]","");
+			urlBuscaCliente = "https://api-v2.contaazul.com/v1/pessoas?documentos=" + cnpjLimpo;
+			respostaCliente = invokeurl
+			[
+				url :urlBuscaCliente
+				type :GET
+				headers:headerMap
+			];
+			idCliente = "";
+			if(respostaCliente.get("totalItems").toLong() > 0)
+			{
+				idCliente = respostaCliente.get("items").get(0).get("id");
+			}
+			else
+			{
+				corpoCliente = Map();
+				corpoCliente.put("nome",accountMap.get("Account_Name"));
+				corpoCliente.put("tipo_pessoa","Jurídica");
+				corpoCliente.put("documento",cnpjLimpo);
+				corpoCliente.put("email",ifnull(accountMap.get("Email"),""));
+				corpoCliente.put("perfis",{"Cliente"});
+				enderecoCliente = Map();
+				enderecoCliente.put("cep",ifnull(accountMap.get("Billing_Code"),""));
+				enderecoCliente.put("logradouro",ifnull(accountMap.get("Billing_Street"),""));
+				enderecoCliente.put("bairro",ifnull(accountMap.get("Bairro"),""));
+				enderecoCliente.put("cidade",ifnull(accountMap.get("Billing_City"),""));
+				enderecoCliente.put("estado",ifnull(accountMap.get("Estado"),""));
+				enderecoCliente.put("pais","Brasil");
+				corpoCliente.put("endereco",enderecoCliente);
+				respostaCriarCliente = invokeurl
+				[
+					url :"https://api-v2.contaazul.com/v1/pessoas"
+					type :POST
+					parameters:corpoCliente.toString()
+					headers:headerMap
+				];
+				idCliente = respostaCriarCliente.get("id");
+			}
+			itensSubform = dealMap.get("Produtos_API");
+			listaItensVenda = List();
+			produtosNaoEncontrados = List();
+			valorTotalVenda = 0;
+			for each  item in itensSubform
+			{
+				skuLookup = item.get("SKU");
+				produtoZoho = zoho.crm.getRecordById("Products",skuLookup.get("id"));
+				codigoSku = produtoZoho.get("Product_Code");
+				urlBuscaProduto = "https://api-v2.contaazul.com/v1/produtos?busca=" + codigoSku;
+				respostaProduto = invokeurl
+				[
+					url :urlBuscaProduto
+					type :GET
+					headers:headerMap
+				];
+				idProdutoEncontrado = "";
+				if(respostaProduto.get("totalItems").toLong() > 0)
+				{
+					listaEncontrados = respostaProduto.get("items");
+					for each  candidato in listaEncontrados
+					{
+						if(candidato.get("codigo") == codigoSku)
+						{
+							idProdutoEncontrado = candidato.get("id");
+						}
+					}
+				}
+				if(idProdutoEncontrado == "")
+				{
+					produtosNaoEncontrados.add(codigoSku);
+				}
+				else
+				{
+					quantidadeItem = item.get("Qtd_Decimal");
+					valorItem = item.get("Valor_Unit_Decimal");
+					itemVenda = Map();
+					itemVenda.put("id",idProdutoEncontrado);
+					itemVenda.put("descricao",produtoZoho.get("Product_Name"));
+					itemVenda.put("quantidade",quantidadeItem);
+					itemVenda.put("valor",valorItem);
+					listaItensVenda.add(itemVenda);
+					valorTotalVenda = valorTotalVenda + quantidadeItem.toDecimal() * valorItem.toDecimal();
+				}
+			}
+			if(produtosNaoEncontrados.size() > 0)
+			{
+				mensagemErro = "Produto(s) não cadastrado(s) no Conta Azul: " + produtosNaoEncontrados.toString();
+				mapaErro = Map();
+				mapaErro.put("Status_ContaAzul_Detalhe",mensagemErro);
+				zoho.crm.updateRecord("Deals",dealId,mapaErro);
+				sendmail
+				[
+					from :zoho.loginuserid
+					to :"importnovello@gmail.com"
+					subject :"Venda NÃO criada no Conta Azul - " + dealMap.get("Deal_Name")
+					message :mensagemErro + "\n\nCadastre o(s) produto(s) no Conta Azul e reprocesse o negócio."
+				]
+				resultadoFinal = mensagemErro;
+			}
+			else
+			{
+				condicaoTextoRaw = dealMap.get("Cond_Pagamento_Lista");
+				if(condicaoTextoRaw == null || condicaoTextoRaw.trim() == "" || condicaoTextoRaw == "-None-")
+				{
+					condicaoTextoRaw = "30";
+				}
+				isAVista = condicaoTextoRaw.toLowerCase().contains("vista");
+				listaParcelas = List();
+				opcaoFormatada = "";
+				if(isAVista)
+				{
+					parcela = Map();
+					parcela.put("data_vencimento",zoho.currentdate.toString("yyyy-MM-dd"));
+					parcela.put("valor",valorTotalVenda.round(2));
+					listaParcelas.add(parcela);
+					opcaoFormatada = "À vista";
+				}
+				else
+				{
+					condicaoLimpa = condicaoTextoRaw.replaceAll("/",",").replaceAll("[^0-9,]","");
+					diasList = condicaoLimpa.toList(",");
+					quantidadeParcelas = diasList.size();
+					valorParcelaBase = (valorTotalVenda / quantidadeParcelas).round(2);
+					somaParcelasAnteriores = 0;
+					indiceAtual = 0;
+					listaDiasLimpos = List();
+					for each  diaTexto in diasList
+					{
+						dias = diaTexto.trim().toLong();
+						listaDiasLimpos.add(dias.toString());
+						parcela = Map();
+						parcela.put("data_vencimento",zoho.currentdate.addDay(dias).toString("yyyy-MM-dd"));
+						if(indiceAtual == quantidadeParcelas - 1)
+						{
+							valorUltimaParcela = (valorTotalVenda - somaParcelasAnteriores).round(2);
+							parcela.put("valor",valorUltimaParcela);
+						}
+						else
+						{
+							parcela.put("valor",valorParcelaBase);
+							somaParcelasAnteriores = somaParcelasAnteriores + valorParcelaBase;
+						}
+						listaParcelas.add(parcela);
+						indiceAtual = indiceAtual + 1;
+					}
+					opcaoFormatada = "";
+					for each  diaTexto2 in listaDiasLimpos
+					{
+						if(opcaoFormatada == "")
+						{
+							opcaoFormatada = diaTexto2;
+						}
+						else
+						{
+							opcaoFormatada = opcaoFormatada + ", " + diaTexto2;
+						}
+					}
+				}
+				condicaoPagamento = Map();
+				condicaoPagamento.put("opcao_condicao_pagamento",opcaoFormatada);
+				condicaoPagamento.put("parcelas",listaParcelas);
+				observacoesTexto = "ORDEM DE COMPRA: " + ifnull(dealMap.get("Ordem_de_Compra"),"-") + " | " + "TRANSPORTADORA: " + ifnull(dealMap.get("Transportadora"),"-") + " | " + "FRETE: " + ifnull(dealMap.get("Frete"),"-") + " | " + "UNIDADE DE FATURAMENTO: " + ifnull(dealMap.get("Unidade_de_Faturamento"),"-") + " | " + "CONDIÇÃO DE PAGAMENTO: " + opcaoFormatada;
+				numeroVenda = dealId.right(8).toLong();
+				corpoVenda = Map();
+				corpoVenda.put("id_cliente",idCliente);
+				corpoVenda.put("numero",numeroVenda);
+				corpoVenda.put("situacao","EM_ANDAMENTO");
+				corpoVenda.put("data_venda",zoho.currentdate.toString("yyyy-MM-dd"));
+				corpoVenda.put("itens",listaItensVenda);
+				corpoVenda.put("observacoes",observacoesTexto);
+				corpoVenda.put("condicao_pagamento",condicaoPagamento);
+				info "PAYLOAD ENVIADO: " + corpoVenda.toString();
+				respostaVenda = invokeurl
+				[
+					url :"https://api-v2.contaazul.com/v1/venda"
+					type :POST
+					parameters:corpoVenda.toString()
+					headers:headerMap
+				];
+				info "RESPOSTA DA CONTA AZUL: " + respostaVenda;
+				if(respostaVenda.get("id") != null)
+				{
+					mapaSucesso = Map();
+					mapaSucesso.put("Conta_Azul_Venda_Id",respostaVenda.get("id"));
+					mapaSucesso.put("Status_ContaAzul_Detalhe","Venda criada: " + respostaVenda.get("numero"));
+					zoho.crm.updateRecord("Deals",dealId,mapaSucesso);
+					resultadoFinal = "Venda criada no Conta Azul: " + respostaVenda.get("id");
+				}
+				else
+				{
+					mapaErro = Map();
+					mapaErro.put("Status_ContaAzul_Detalhe","Erro Conta Azul: " + respostaVenda.toString());
+					mapaErro.put("Stage","Negotiation/Review");
+					zoho.crm.updateRecord("Deals",dealId,mapaErro);
+					resultadoFinal = "Erro ao criar venda: " + respostaVenda.toString();
+				}
+			}
+		}
+	}
+}
+catch (e)
+{
+	sendmail
+	[
+		from :zoho.loginuserid
+		to :"importnovello@gmail.com"
+		subject :"ERRO ao criar venda no Conta Azul - Deal " + dealId
+		message :"Erro capturado: " + e
+	]
+	mapaErro = Map();
+	mapaErro.put("Status_ContaAzul_Detalhe","ERRO: " + e);
+	mapaErro.put("Stage","Negotiation/Review");
+	zoho.crm.updateRecord("Deals",dealId,mapaErro);
+	resultadoFinal = "ERRO CAPTURADO: " + e;
+}
+return resultadoFinal;
+}

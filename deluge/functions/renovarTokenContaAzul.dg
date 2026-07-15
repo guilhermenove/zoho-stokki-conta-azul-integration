@@ -1,0 +1,66 @@
+// Zoho CRM - Custom Function (Deluge)
+// Renova o access_token do Conta Azul via OAuth2 (fluxo refresh_token) e
+// persiste o novo refresh_token em um registro de Account usado como
+// "cofre" de configuração ("CONFIG - INTEGRACOES").
+//
+// É a função de autenticação usada por todas as demais integrações com o
+// Conta Azul (criarVendaContaAzul, enviarNFeParaStokki, etc).
+//
+// Fluxo:
+//   1. Busca o refresh_token atual salvo no campo customizado
+//      ContaAzul_Refresh_Token da Account de configuração.
+//   2. Faz Basic Auth com client_id:client_secret (Base64) e chama o
+//      endpoint OAuth2 do Conta Azul (POST /oauth2/token, grant_type
+//      refresh_token).
+//   3. O Conta Azul retorna um novo access_token E um novo refresh_token
+//      (rotação de refresh token) - o novo refresh_token é salvo de volta
+//      na Account de configuração, substituindo o anterior.
+//   4. Retorna o access_token para uso imediato nas chamadas seguintes.
+//
+// ATENÇÃO - CREDENCIAIS:
+//   clientId e clientSecret (credenciais do app OAuth do Conta Azul) foram
+//   REDIGIDOS nesta versão documentada. O ideal é buscá-los de uma
+//   Connection do Zoho (zoho.crm.invokeConnector com Conta Azul configurado
+//   como Connection OAuth2) em vez de hardcoded na função.
+//   >>> Essas credenciais devem ser rotacionadas no painel de desenvolvedor
+//       do Conta Azul, pois circularam em texto puro fora do Zoho.
+//
+// Dependências:
+//   - Registro de Account "CONFIG - INTEGRACOES" (contaConfigId) com o
+//     campo customizado ContaAzul_Refresh_Token
+//
+// Retorno:
+//   String com o access_token válido do Conta Azul
+
+string automation.renovarTokenContaAzul()
+{
+clientId = "{{CONTAAZUL_CLIENT_ID}}"; // REDIGIDO - buscar de Connection/Variável segura
+clientSecret = "{{CONTAAZUL_CLIENT_SECRET}}"; // REDIGIDO - buscar de Connection/Variável segura
+contaConfigId = "7485108000000836001";
+// Conta "CONFIG - INTEGRACOES"
+contaMap = zoho.crm.getRecordById("Accounts",contaConfigId);
+refreshToken = contaMap.get("ContaAzul_Refresh_Token");
+credenciais = clientId + ":" + clientSecret;
+credenciaisBase64 = zoho.encryption.base64Encode(credenciais);
+corpoRequisicao = Map();
+corpoRequisicao.put("refresh_token",refreshToken);
+corpoRequisicao.put("grant_type","refresh_token");
+headerMap = Map();
+headerMap.put("Authorization","Basic " + credenciaisBase64);
+headerMap.put("Content-Type","application/x-www-form-urlencoded");
+resposta = invokeurl
+[
+	url :"https://auth.contaazul.com/oauth2/token"
+	type :POST
+	parameters:corpoRequisicao
+	headers:headerMap
+];
+novoRefreshToken = resposta.get("refresh_token");
+if(novoRefreshToken != null)
+{
+	mapaAtualizacao = Map();
+	mapaAtualizacao.put("ContaAzul_Refresh_Token",novoRefreshToken);
+	zoho.crm.updateRecord("Accounts",contaConfigId,mapaAtualizacao);
+}
+return resposta.get("access_token");
+}
