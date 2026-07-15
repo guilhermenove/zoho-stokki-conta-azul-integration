@@ -1,0 +1,66 @@
+// Zoho CRM - Custom Function (Deluge)
+// Módulo: Accounts
+// Preenche automaticamente os dados cadastrais de uma Account a partir do CNPJ,
+// consultando a Receita Federal via BrasilAPI.
+//
+// Gatilho sugerido: Workflow Rule no módulo Accounts, quando o campo CNPJ é
+// preenchido/alterado (on create / on edit).
+//
+// Parâmetros:
+//   accountId (String) - ID do registro de Account no Zoho CRM
+//
+// Retorno:
+//   String com o resultado da execução (sucesso, erro ou motivo de não execução)
+
+string automation.preencherDadosCNPJ(String accountId)
+{
+resultadoFinal = "";
+try
+{
+	accountMap = zoho.crm.getRecordById("Accounts",accountId);
+	cnpjBruto = accountMap.get("CNPJ");
+	if(cnpjBruto == null || cnpjBruto == "")
+	{
+		resultadoFinal = "CNPJ vazio, nada a fazer.";
+	}
+	else
+	{
+		cnpjLimpo = cnpjBruto.replaceAll("[^0-9]","");
+		if(cnpjLimpo.length() != 14)
+		{
+			resultadoFinal = "CNPJ inválido (precisa ter 14 dígitos): " + cnpjBruto;
+		}
+		else
+		{
+			urlConsulta = "https://brasilapi.com.br/api/cnpj/v1/" + cnpjLimpo;
+			resposta = invokeurl
+			[
+				url :urlConsulta
+				type :GET
+			];
+			if(resposta.get("razao_social") != null)
+			{
+				mapaAtualizacao = Map();
+				mapaAtualizacao.put("Account_Name",resposta.get("razao_social"));
+				mapaAtualizacao.put("Phone",ifnull(resposta.get("ddd_telefone_1"),""));
+				mapaAtualizacao.put("Billing_Street",ifnull(resposta.get("logradouro"),"") + ", " + ifnull(resposta.get("numero"),""));
+				mapaAtualizacao.put("Billing_City",ifnull(resposta.get("municipio"),""));
+				mapaAtualizacao.put("Billing_Code",ifnull(resposta.get("cep"),""));
+				mapaAtualizacao.put("Bairro",ifnull(resposta.get("bairro"),""));
+				mapaAtualizacao.put("Estado",ifnull(resposta.get("uf"),""));
+				zoho.crm.updateRecord("Accounts",accountId,mapaAtualizacao);
+				resultadoFinal = "Dados preenchidos com sucesso para: " + resposta.get("razao_social");
+			}
+			else
+			{
+				resultadoFinal = "CNPJ não encontrado na Receita: " + cnpjBruto;
+			}
+		}
+	}
+}
+catch (e)
+{
+	resultadoFinal = "ERRO: " + e;
+}
+return resultadoFinal;
+}
