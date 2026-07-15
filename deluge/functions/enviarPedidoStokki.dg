@@ -1,0 +1,289 @@
+// Zoho CRM - Custom Function (Deluge)
+// Módulo: Deals
+// Função ORQUESTRADORA da integração: valida o Deal, envia o pedido de saída
+// (outbound) para o Stokki (OMS) e, em seguida, dispara a criação da venda no
+// Conta Azul (automation.criarVendaContaAzul).
+//
+// Gatilho sugerido: Workflow Rule no módulo Deals quando o Stage muda para
+// "Closed Won" (Ganho).
+//
+// Fluxo:
+//   1. Se o Deal já tiver um Stokki_Order_Id, pula o envio ao Stokki e só
+//      chama automation.criarVendaContaAzul (idempotência).
+//   2. Validações obrigatórias antes de enviar qualquer coisa:
+//      - Deal precisa ter Account vinculada
+//      - Campos: Transportadora, Frete (CIF/FOB), Condição de Pagamento,
+//        Ordem de Compra
+//      - Deal precisa ter ao menos 1 produto no subform Produtos_API
+//      - Account precisa ter CNPJ preenchido
+//      Falhando qualquer uma: bloqueia tudo, devolve o Deal para o estágio
+//      "Negotiation/Review" e envia e-mail de alerta. NADA é enviado (nem
+//      Stokki, nem Conta Azul).
+//   3. Para cada produto do Deal, consulta o estoque disponível no Stokki
+//      (GET /inventory/show?sku=...). Se a quantidade disponível for menor
+//      que a solicitada, bloqueia o pedido inteiro e alerta por e-mail.
+//   4. Monta o payload de outbound (destino/cliente, transportadora, produtos)
+//      e envia para o Stokki (POST /oms/outbound/store).
+//   5. Grava o Amount do Deal, o status da integração e o Stokki_Order_Id
+//      retornado.
+//   6. Chama automation.criarVendaContaAzul(dealId) para criar a venda
+//      correspondente no Conta Azul.
+//
+// ATENÇÃO - CREDENCIAIS:
+//   O token do Stokki (stokkiToken) foi REDIGIDO nesta versão documentada -
+//   ver nota em enviarNFeParaStokki.dg. Buscar de Connection/Variável segura.
+//
+// Dependências:
+//   - automation.criarVendaContaAzul(dealId)
+//   - Campos customizados em Deals: Stokki_Order_Id, Status_Integra_o_Stokki,
+//     Status_ContaAzul_Detalhe, Produtos_API, Transportadora, Frete,
+//     Cond_Pagamento_Lista, Ordem_de_Compra
+//   - Campos customizados em Accounts: CNPJ, Billing_Code, Billing_Street,
+//     Bairro, Billing_City, Estado, Phone, Email
+//   - Campo customizado em Products: Product_Code (SKU usado no Stokki)
+//   - Dados fixos de transportadora (CNPJ/endereço) hardcoded no payload
+//     "carrier" - ajustar conforme a transportadora real utilizada.
+//
+// Parâmetros:
+//   dealId (String) - ID do registro de Deal no Zoho CRM
+//
+// Retorno:
+//   String com o resultado da execução (sucesso, erro ou motivo de bloqueio)
+
+string automation.enviarPedidoStokki(String dealId)
+{
+resultadoFinal = "";
+try
+{
+	dealMap = zoho.crm.getRecordById("Deals",dealId);
+	stokkiOrderIdExistente = dealMap.get("Stokki_Order_Id");
+	jaEnviadoStokki = stokkiOrderIdExistente != null && stokkiOrderIdExistente != "";
+	if(!jaEnviadoStokki)
+	{
+		stokkiToken = "{{STOKKI_TOKEN}}"; // REDIGIDO - buscar de Connection/Variável segura
+		stokkiUrlPedido = "https://novellohuaxin.stokki.com.br/api/stokki/oms/outbound/store";
+		stokkiUrlEstoque = "https://novellohuaxin.stokki.com.br/api/stokki/oms/inventory/show";
+		accountId = dealMap.get("Account_Name");
+		if(accountId == null)
+		{
+			resultadoFinal = "❌ VALIDAÇÃO FALHOU: Negócio sem Conta vinculada.";
+			mapaErro = Map();
+			mapaErro.put("Status_Integra_o_Stokki",resultadoFinal);
+			mapaErro.put("Status_ContaAzul_Detalhe",resultadoFinal);
+			mapaErro.put("Stage","Negotiation/Review");
+			zoho.crm.updateRecord("Deals",dealId,mapaErro);
+		}
+		else
+		{
+			accountMap = zoho.crm.getRecordById("Accounts",accountId.get("id"));
+			itensSubform = dealMap.get("Produtos_API");
+			mensagensErro = List();
+			transportadora = dealMap.get("Transportadora");
+			frete = dealMap.get("Frete");
+			condPagamento = dealMap.get("Cond_Pagamento_Lista");
+			ordemCompra = dealMap.get("Ordem_de_Compra");
+			cnpjConta = accountMap.get("CNPJ");
+			if(transportadora == null || transportadora.trim() == "")
+			{
+				mensagensErro.add("Campo 'Transportadora' não preenchido.");
+			}
+			if(frete == null || frete == "" || frete == "-None-")
+			{
+				mensagensErro.add("Campo 'Frete' (CIF/FOB) não preenchido.");
+			}
+			if(condPagamento == null || condPagamento == "" || condPagamento == "-None-")
+			{
+				mensagensErro.add("Campo 'Condição de Pagamento' não preenchido.");
+			}
+			if(ordemCompra == null || ordemCompra.trim() == "")
+			{
+				mensagensErro.add("Campo 'Ordem de Compra' não preenchido.");
+			}
+			if(itensSubform == null || itensSubform.size() == 0)
+			{
+				// ===== BLOQUEIO: sem produtos =====
+				mensagensErro.add("Nenhum produto adicionado no negócio (Produtos - API).");
+			}
+			if(cnpjConta == null || cnpjConta.trim() == "")
+			{
+				// ===== BLOQUEIO: conta sem CNPJ =====
+				mensagensErro.add("Conta '" + accountMap.get("Account_Name") + "' sem CNPJ cadastrado.");
+			}
+			if(mensagensErro.size() > 0)
+			{
+				mensagemCompleta = "❌ CAMPOS OBRIGATÓRIOS FALTANDO:\n" + mensagensErro.toString();
+				resultadoFinal = mensagemCompleta;
+				sendmail
+				[
+					from :zoho.loginuserid
+					to :"importnovello@gmail.com"
+					subject :"Negócio incompleto - Nada foi enviado - " + dealMap.get("Deal_Name")
+					message :"O negócio " + dealMap.get("Deal_Name") + " foi marcado como Ganho, mas os seguintes campos obrigatórios estão vazios:\n\n" + mensagensErro.toString() + "\n\nPreencha e reprocesse o negócio (edite qualquer campo e salve novamente). O negócio foi devolvido para o estágio anterior."
+				]
+				mapaErro = Map();
+				mapaErro.put("Status_Integra_o_Stokki",mensagemCompleta);
+				mapaErro.put("Status_ContaAzul_Detalhe","Bloqueado: campos obrigatórios faltando");
+				mapaErro.put("Stage","Negotiation/Review");
+				zoho.crm.updateRecord("Deals",dealId,mapaErro);
+			}
+			else
+			{
+				listaProdutos = List();
+				valorTotalNegocio = 0;
+				for each  item in itensSubform
+				{
+					skuLookup = item.get("SKU");
+					quantidadeSolicitada = item.get("Qtd_Decimal");
+					if(skuLookup == null)
+					{
+						mensagensErro.add("Item sem SKU selecionado.");
+					}
+					else if(quantidadeSolicitada == null || quantidadeSolicitada.toDecimal() <= 0)
+					{
+						produtoTemp = zoho.crm.getRecordById("Products",skuLookup.get("id"));
+						mensagensErro.add(produtoTemp.get("Product_Code") + ": quantidade inválida ou zerada.");
+					}
+					else
+					{
+						produtoCompleto = zoho.crm.getRecordById("Products",skuLookup.get("id"));
+						skuCodigo = produtoCompleto.get("Product_Code");
+						valorUnitItem = item.get("Valor_Unit_Decimal");
+						valorTotalNegocio = valorTotalNegocio + quantidadeSolicitada.toDecimal() * valorUnitItem.toDecimal();
+						urlConsultaEstoque = stokkiUrlEstoque + "?token=" + stokkiToken + "&sku=" + skuCodigo;
+						respostaEstoque = invokeurl
+						[
+							url :urlConsultaEstoque
+							type :GET
+						];
+						disponivel = 0;
+						if(respostaEstoque != null && respostaEstoque.size() > 0)
+						{
+							primeiroItemEstoque = respostaEstoque.get(0);
+							if(primeiroItemEstoque.containKey("product"))
+							{
+								disponivel = ifnull(primeiroItemEstoque.get("product").get("quantity_available"),0).toDecimal();
+							}
+						}
+						if(disponivel < quantidadeSolicitada.toDecimal())
+						{
+							mensagensErro.add(skuCodigo + ": pedido " + quantidadeSolicitada + ", disponível apenas " + disponivel);
+						}
+						else
+						{
+							produtoMap = Map();
+							produtoMap.put("sku",skuCodigo);
+							produtoMap.put("quantity",quantidadeSolicitada);
+							produtoMap.put("unitary_value",valorUnitItem.toString());
+							listaProdutos.add(produtoMap);
+						}
+					}
+				}
+				if(mensagensErro.size() > 0)
+				{
+					mensagemCompleta = "❌ VALIDAÇÃO FALHOU:\n" + mensagensErro.toString();
+					resultadoFinal = mensagemCompleta;
+					sendmail
+					[
+						from :zoho.loginuserid
+						to :"importnovello@gmail.com"
+						subject :"Pedido NÃO enviado (Stokki + Conta Azul) - " + dealMap.get("Deal_Name")
+						message :"O negócio " + dealMap.get("Deal_Name") + " foi marcado como Ganho, mas NADA foi enviado (nem Stokki, nem Conta Azul) por causa de:\n\n" + mensagensErro.toString() + "\n\nO negócio foi devolvido para o estágio anterior."
+					]
+					mapaErro = Map();
+					mapaErro.put("Status_Integra_o_Stokki",mensagemCompleta);
+					mapaErro.put("Status_ContaAzul_Detalhe","Bloqueado: validação de estoque falhou");
+					mapaErro.put("Stage","Negotiation/Review");
+					zoho.crm.updateRecord("Deals",dealId,mapaErro);
+				}
+				else
+				{
+					destino = Map();
+					destino.put("type_account","company");
+					destino.put("cpf",ifnull(accountMap.get("CNPJ"),""));
+					destino.put("name",accountMap.get("Account_Name"));
+					destino.put("telephone",ifnull(accountMap.get("Phone"),""));
+					destino.put("email",ifnull(accountMap.get("Email"),""));
+					destino.put("zip",ifnull(accountMap.get("Billing_Code"),""));
+					destino.put("street",ifnull(accountMap.get("Billing_Street"),""));
+					destino.put("number","");
+					destino.put("complement","");
+					destino.put("district",ifnull(accountMap.get("Bairro"),""));
+					destino.put("city",ifnull(accountMap.get("Billing_City"),""));
+					destino.put("state",ifnull(accountMap.get("Estado"),""));
+					destino.put("country","Brasil");
+					carrier = Map();
+					carrier.put("name",transportadora);
+					carrier.put("company_name",transportadora);
+					carrier.put("cnpj","35149864000153");
+					carrier.put("street","Gen. Mário Tourinho");
+					carrier.put("city","Curitiba");
+					carrier.put("state","PR");
+					pedido = Map();
+					pedido.put("order_id",dealId);
+					pedido.put("number_erp",dealId);
+					pedido.put("po",dealMap.get("Deal_Name"));
+					pedido.put("warehouse_id","1");
+					pedido.put("packaging","Paletizado");
+					pedido.put("type_transport","Fracionado (LTL)");
+					pedido.put("order_date",zoho.currenttime.toString("yyyy-MM-dd HH:mm:ss"));
+					pedido.put("expedition_date",zoho.currentdate.addDay(1).toString("yyyy-MM-dd"));
+					pedido.put("same_day_delivery",0);
+					pedido.put("express_delivery",0);
+					pedido.put("super_express_delivery",0);
+					pedido.put("pickup",0);
+					pedido.put("destination",destino);
+					pedido.put("carrier",carrier);
+					pedido.put("products",listaProdutos);
+					listaPedidos = List();
+					listaPedidos.add(pedido);
+					corpoRequisicao = Map();
+					corpoRequisicao.put("token",stokkiToken);
+					corpoRequisicao.put("outbounds",listaPedidos);
+					headerMap = Map();
+					headerMap.put("Content-Type","application/json");
+					resposta = invokeurl
+					[
+						url :stokkiUrlPedido
+						type :POST
+						parameters:corpoRequisicao.toString()
+						headers:headerMap
+					];
+					respostaPedido = resposta.get(0);
+					mapaAtualizacao = Map();
+					mapaAtualizacao.put("Amount",valorTotalNegocio.round(2));
+					mapaAtualizacao.put("Status_Integra_o_Stokki",respostaPedido.get("statusDsc") + " - " + ifnull(respostaPedido.get("message"),""));
+					if(respostaPedido.get("stokkiId") != null)
+					{
+						mapaAtualizacao.put("Stokki_Order_Id",respostaPedido.get("stokkiId"));
+					}
+					zoho.crm.updateRecord("Deals",dealId,mapaAtualizacao);
+					resultadoContaAzul = automation.criarVendaContaAzul(dealId);
+					info resultadoContaAzul;
+					resultadoFinal = "Pedido Stokki enviado. Conta Azul: " + resultadoContaAzul;
+				}
+			}
+		}
+	}
+	else
+	{
+		resultadoContaAzul = automation.criarVendaContaAzul(dealId);
+		resultadoFinal = "Stokki já enviado. Conta Azul: " + resultadoContaAzul;
+	}
+}
+catch (e)
+{
+	sendmail
+	[
+		from :zoho.loginuserid
+		to :"importnovello@gmail.com"
+		subject :"ERRO na integração - Deal " + dealId
+		message :"Erro capturado: " + e
+	]
+	mapaErro = Map();
+	mapaErro.put("Status_Integra_o_Stokki","ERRO: " + e);
+	mapaErro.put("Stage","Negotiation/Review");
+	zoho.crm.updateRecord("Deals",dealId,mapaErro);
+	resultadoFinal = "ERRO CAPTURADO: " + e;
+}
+return resultadoFinal;
+}
