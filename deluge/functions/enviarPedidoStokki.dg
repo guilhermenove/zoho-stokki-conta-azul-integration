@@ -1,15 +1,23 @@
 // Zoho CRM - Custom Function (Deluge)
 // Módulo: Deals
-// Função ORQUESTRADORA da integração: valida o Deal, envia o pedido de saída
-// (outbound) para o Stokki (OMS) e, em seguida, dispara a criação da venda no
-// Conta Azul (automation.criarVendaContaAzul).
+// Função ORQUESTRADORA da integração: valida o Deal, cria a venda no Conta
+// Azul (automation.criarVendaContaAzul) e, só se isso der certo, envia o
+// pedido de saída (outbound) para o Stokki (OMS).
 //
 // Gatilho sugerido: Workflow Rule no módulo Deals quando o Stage muda para
 // "Closed Won" (Ganho).
 //
+// IMPORTANTE - ORDEM Conta Azul -> Stokki:
+//   O Conta Azul é acionado ANTES do Stokki de propósito. A criação da venda
+//   pode falhar por motivos financeiros que nada têm a ver com estoque (ex:
+//   saldo/crédito insuficiente do cliente). Se o Stokki fosse acionado
+//   primeiro, um pedido de separação real chegaria ao depósito mesmo que a
+//   venda não pudesse ser faturada. Só depois que o Conta Azul confirma a
+//   venda é que o pedido físico é enviado ao Stokki.
+//
 // Fluxo:
-//   1. Se o Deal já tiver um Stokki_Order_Id, pula o envio ao Stokki e só
-//      chama automation.criarVendaContaAzul (idempotência).
+//   1. Se o Deal já tiver um Stokki_Order_Id, pula direto para (re)tentar
+//      automation.criarVendaContaAzul (idempotência - não reenvia ao Stokki).
 //   2. Validações obrigatórias antes de enviar qualquer coisa:
 //      - Deal precisa ter Account vinculada
 //      - Campos: Transportadora, Frete (CIF/FOB), Condição de Pagamento,
@@ -20,14 +28,17 @@
 //      "Negotiation/Review" e envia e-mail de alerta. NADA é enviado (nem
 //      Stokki, nem Conta Azul).
 //   3. Para cada produto do Deal, consulta o estoque disponível no Stokki
-//      (GET /inventory/show?sku=...). Se a quantidade disponível for menor
-//      que a solicitada, bloqueia o pedido inteiro e alerta por e-mail.
-//   4. Monta o payload de outbound (destino/cliente, transportadora, produtos)
-//      e envia para o Stokki (POST /oms/outbound/store).
-//   5. Grava o Amount do Deal, o status da integração e o Stokki_Order_Id
-//      retornado.
-//   6. Chama automation.criarVendaContaAzul(dealId) para criar a venda
-//      correspondente no Conta Azul.
+//      (GET /inventory/show?sku=...) - checagem só de leitura, sem criar
+//      nada. Se a quantidade disponível for menor que a solicitada, bloqueia
+//      o pedido inteiro e alerta por e-mail.
+//   4. Grava o Amount do Deal e chama automation.criarVendaContaAzul(dealId).
+//      Se a venda NÃO for criada (ex: saldo insuficiente, cliente inválido),
+//      para aqui - o Stokki nunca é acionado. criarVendaContaAzul já cuida de
+//      registrar o motivo em Status_ContaAzul_Detalhe e devolver o Stage.
+//   5. Só se a venda no Conta Azul for criada com sucesso: monta o payload de
+//      outbound (destino/cliente, transportadora, produtos) e envia para o
+//      Stokki (POST /oms/outbound/store), gravando Status_Integra_o_Stokki e
+//      o Stokki_Order_Id retornado.
 //
 // ATENÇÃO - CREDENCIAIS:
 //   O token do Stokki (stokkiToken) foi REDIGIDO nesta versão documentada -
@@ -197,69 +208,88 @@ try
 				}
 				else
 				{
-					destino = Map();
-					destino.put("type_account","company");
-					destino.put("cpf",ifnull(accountMap.get("CNPJ"),""));
-					destino.put("name",accountMap.get("Account_Name"));
-					destino.put("telephone",ifnull(accountMap.get("Phone"),""));
-					destino.put("email",ifnull(accountMap.get("Email"),""));
-					destino.put("zip",ifnull(accountMap.get("Billing_Code"),""));
-					destino.put("street",ifnull(accountMap.get("Billing_Street"),""));
-					destino.put("number","");
-					destino.put("complement","");
-					destino.put("district",ifnull(accountMap.get("Bairro"),""));
-					destino.put("city",ifnull(accountMap.get("Billing_City"),""));
-					destino.put("state",ifnull(accountMap.get("Estado"),""));
-					destino.put("country","Brasil");
-					carrier = Map();
-					carrier.put("name",transportadora);
-					carrier.put("company_name",transportadora);
-					carrier.put("cnpj","35149864000153");
-					carrier.put("street","Gen. Mário Tourinho");
-					carrier.put("city","Curitiba");
-					carrier.put("state","PR");
-					pedido = Map();
-					pedido.put("order_id",dealId);
-					pedido.put("number_erp",dealId);
-					pedido.put("po",dealMap.get("Deal_Name"));
-					pedido.put("warehouse_id","1");
-					pedido.put("packaging","Paletizado");
-					pedido.put("type_transport","Fracionado (LTL)");
-					pedido.put("order_date",zoho.currenttime.toString("yyyy-MM-dd HH:mm:ss"));
-					pedido.put("expedition_date",zoho.currentdate.addDay(1).toString("yyyy-MM-dd"));
-					pedido.put("same_day_delivery",0);
-					pedido.put("express_delivery",0);
-					pedido.put("super_express_delivery",0);
-					pedido.put("pickup",0);
-					pedido.put("destination",destino);
-					pedido.put("carrier",carrier);
-					pedido.put("products",listaProdutos);
-					listaPedidos = List();
-					listaPedidos.add(pedido);
-					corpoRequisicao = Map();
-					corpoRequisicao.put("token",stokkiToken);
-					corpoRequisicao.put("outbounds",listaPedidos);
-					headerMap = Map();
-					headerMap.put("Content-Type","application/json");
-					resposta = invokeurl
-					[
-						url :stokkiUrlPedido
-						type :POST
-						parameters:corpoRequisicao.toString()
-						headers:headerMap
-					];
-					respostaPedido = resposta.get(0);
-					mapaAtualizacao = Map();
-					mapaAtualizacao.put("Amount",valorTotalNegocio.round(2));
-					mapaAtualizacao.put("Status_Integra_o_Stokki",respostaPedido.get("statusDsc") + " - " + ifnull(respostaPedido.get("message"),""));
-					if(respostaPedido.get("stokkiId") != null)
-					{
-						mapaAtualizacao.put("Stokki_Order_Id",respostaPedido.get("stokkiId"));
-					}
-					zoho.crm.updateRecord("Deals",dealId,mapaAtualizacao);
+					// ===== Conta Azul PRIMEIRO: só compromete o Stokki (ação física,
+					// no WMS) depois que a venda for validada/criada no financeiro.
+					// Evita mandar pedido de separação para o depósito quando a venda
+					// não pode ser faturada (ex: saldo/crédito insuficiente no Conta Azul).
+					mapaAmount = Map();
+					mapaAmount.put("Amount",valorTotalNegocio.round(2));
+					zoho.crm.updateRecord("Deals",dealId,mapaAmount);
 					resultadoContaAzul = automation.criarVendaContaAzul(dealId);
 					info resultadoContaAzul;
-					resultadoFinal = "Pedido Stokki enviado. Conta Azul: " + resultadoContaAzul;
+					if(!resultadoContaAzul.startsWith("Venda criada no Conta Azul"))
+					{
+						// criarVendaContaAzul já grava Status_ContaAzul_Detalhe e devolve
+						// o Stage para revisão em caso de falha; aqui só registramos que
+						// o Stokki nem chegou a ser acionado.
+						mapaBloqueio = Map();
+						mapaBloqueio.put("Status_Integra_o_Stokki","Não enviado ao Stokki: falha ao criar a venda no Conta Azul.");
+						zoho.crm.updateRecord("Deals",dealId,mapaBloqueio);
+						resultadoFinal = "Bloqueado antes do Stokki (nenhum pedido físico foi criado). Conta Azul: " + resultadoContaAzul;
+					}
+					else
+					{
+						destino = Map();
+						destino.put("type_account","company");
+						destino.put("cpf",ifnull(accountMap.get("CNPJ"),""));
+						destino.put("name",accountMap.get("Account_Name"));
+						destino.put("telephone",ifnull(accountMap.get("Phone"),""));
+						destino.put("email",ifnull(accountMap.get("Email"),""));
+						destino.put("zip",ifnull(accountMap.get("Billing_Code"),""));
+						destino.put("street",ifnull(accountMap.get("Billing_Street"),""));
+						destino.put("number","");
+						destino.put("complement","");
+						destino.put("district",ifnull(accountMap.get("Bairro"),""));
+						destino.put("city",ifnull(accountMap.get("Billing_City"),""));
+						destino.put("state",ifnull(accountMap.get("Estado"),""));
+						destino.put("country","Brasil");
+						carrier = Map();
+						carrier.put("name",transportadora);
+						carrier.put("company_name",transportadora);
+						carrier.put("cnpj","35149864000153");
+						carrier.put("street","Gen. Mário Tourinho");
+						carrier.put("city","Curitiba");
+						carrier.put("state","PR");
+						pedido = Map();
+						pedido.put("order_id",dealId);
+						pedido.put("number_erp",dealId);
+						pedido.put("po",dealMap.get("Deal_Name"));
+						pedido.put("warehouse_id","1");
+						pedido.put("packaging","Paletizado");
+						pedido.put("type_transport","Fracionado (LTL)");
+						pedido.put("order_date",zoho.currenttime.toString("yyyy-MM-dd HH:mm:ss"));
+						pedido.put("expedition_date",zoho.currentdate.addDay(1).toString("yyyy-MM-dd"));
+						pedido.put("same_day_delivery",0);
+						pedido.put("express_delivery",0);
+						pedido.put("super_express_delivery",0);
+						pedido.put("pickup",0);
+						pedido.put("destination",destino);
+						pedido.put("carrier",carrier);
+						pedido.put("products",listaProdutos);
+						listaPedidos = List();
+						listaPedidos.add(pedido);
+						corpoRequisicao = Map();
+						corpoRequisicao.put("token",stokkiToken);
+						corpoRequisicao.put("outbounds",listaPedidos);
+						headerMap = Map();
+						headerMap.put("Content-Type","application/json");
+						resposta = invokeurl
+						[
+							url :stokkiUrlPedido
+							type :POST
+							parameters:corpoRequisicao.toString()
+							headers:headerMap
+						];
+						respostaPedido = resposta.get(0);
+						mapaAtualizacao = Map();
+						mapaAtualizacao.put("Status_Integra_o_Stokki",respostaPedido.get("statusDsc") + " - " + ifnull(respostaPedido.get("message"),""));
+						if(respostaPedido.get("stokkiId") != null)
+						{
+							mapaAtualizacao.put("Stokki_Order_Id",respostaPedido.get("stokkiId"));
+						}
+						zoho.crm.updateRecord("Deals",dealId,mapaAtualizacao);
+						resultadoFinal = "Venda criada no Conta Azul. Pedido Stokki enviado: " + resultadoContaAzul;
+					}
 				}
 			}
 		}

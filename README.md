@@ -21,19 +21,14 @@ e estoque) e o **Conta Azul** (ERP financeiro/fiscal).
               │ 1. Valida campos obrigatórios do Deal        │
               │    e CNPJ da Account                         │
               │ 2. Consulta estoque disponível no Stokki      │
-              │    (por SKU) e bloqueia se insuficiente       │
+              │    (por SKU, só leitura) e bloqueia se        │
+              │    insuficiente                               │
               └─────────────────────┬──────────────────────┘
                                     │ OK
                                     ▼
                     ┌───────────────────────────────┐
-                    │  POST /oms/outbound/store       │
-                    │  (Stokki) — cria pedido de saída │
-                    └───────────────┬───────────────┘
-                                    │ grava Stokki_Order_Id no Deal
-                                    ▼
-                    ┌───────────────────────────────┐
-                    │  criarVendaContaAzul(dealId)    │
-                    └───────────────┬───────────────┘
+                    │  criarVendaContaAzul(dealId)    │  ◄── financeiro
+                    └───────────────┬───────────────┘        primeiro
                                     │
               ┌─────────────────────┼──────────────────────┐
               │ 1. renovarTokenContaAzul() — OAuth2           │
@@ -46,7 +41,19 @@ e estoque) e o **Conta Azul** (ERP financeiro/fiscal).
                     ┌───────────────────────────────┐
                     │   POST /v1/venda (Conta Azul)   │
                     │   grava Conta_Azul_Venda_Id      │
-                    └───────────────────────────────┘
+                    └───────────────┬───────────────┘
+                            venda criada?
+                     ┌───────────────┴───────────────┐
+                   NÃO                               SIM
+                     │                                 │
+                     ▼                                 ▼
+       Para aqui. Stokki NUNCA         ┌───────────────────────────────┐
+       é acionado — nenhum pedido      │  POST /oms/outbound/store       │
+       físico é criado.                │  (Stokki) — cria pedido de saída │
+       Stage volta p/ revisão.         └───────────────┬───────────────┘
+                                                        │ grava Stokki_Order_Id
+                                                        ▼
+                                                    (fim do fluxo)
 
 
       ── (fluxo separado, após faturamento da NF-e no Conta Azul) ──
@@ -80,7 +87,7 @@ Além disso, **de forma independente** desse fluxo principal, existe:
 |---|---|---|
 | [`deluge/functions/preencherDadosCNPJ.dg`](deluge/functions/preencherDadosCNPJ.dg) | `automation.preencherDadosCNPJ(accountId)` | Enriquece a Account com dados da Receita Federal (BrasilAPI) a partir do CNPJ. |
 | [`deluge/functions/renovarTokenContaAzul.dg`](deluge/functions/renovarTokenContaAzul.dg) | `automation.renovarTokenContaAzul()` | Renova o `access_token` OAuth2 do Conta Azul, rotacionando o `refresh_token` salvo na Account de configuração. |
-| [`deluge/functions/enviarPedidoStokki.dg`](deluge/functions/enviarPedidoStokki.dg) | `automation.enviarPedidoStokki(dealId)` | **Orquestrador.** Valida o Deal, checa estoque no Stokki, envia o pedido (outbound) e dispara a criação da venda no Conta Azul. |
+| [`deluge/functions/enviarPedidoStokki.dg`](deluge/functions/enviarPedidoStokki.dg) | `automation.enviarPedidoStokki(dealId)` | **Orquestrador.** Valida o Deal, checa estoque no Stokki (leitura), cria a venda no Conta Azul e — só se der certo — envia o pedido (outbound) ao Stokki. |
 | [`deluge/functions/criarVendaContaAzul.dg`](deluge/functions/criarVendaContaAzul.dg) | `automation.criarVendaContaAzul(dealId)` | Cria/atualiza o cliente no Conta Azul por CNPJ, resolve produtos por SKU, monta parcelas e envia a venda. |
 | [`deluge/functions/enviarNFeParaStokki.dg`](deluge/functions/enviarNFeParaStokki.dg) | `automation.enviarNFeParaStokki(chaveAcesso, numberErp)` | Baixa o XML da NF-e do Conta Azul, hospeda no Supabase Storage e envia a URL ao Stokki para vincular a nota ao pedido. |
 
@@ -133,6 +140,18 @@ nos painéis do Supabase, Stokki e Conta Azul.
 - Restringir a Service Role Key do Supabase a um bucket/policy específico,
   ou trocar por uma signed URL de curta duração em vez de expor o arquivo
   publicamente.
+
+## ⚠️ Ordem Conta Azul → Stokki
+
+`enviarPedidoStokki` cria a venda no **Conta Azul antes** de enviar o pedido
+físico ao **Stokki**, de propósito. A criação da venda pode falhar por
+motivos financeiros que não têm relação com estoque (ex: saldo/crédito
+insuficiente do cliente no Conta Azul). Se o Stokki fosse acionado primeiro,
+um pedido de separação real chegaria ao depósito mesmo que a venda não
+pudesse ser faturada — foi exatamente esse cenário que apareceu em teste
+(pedido criado no Stokki com o Conta Azul retornando erro de saldo
+insuficiente). Com a ordem invertida, nenhum pedido físico é criado quando o
+Conta Azul rejeita a venda.
 
 ## Tratamento de erros
 
