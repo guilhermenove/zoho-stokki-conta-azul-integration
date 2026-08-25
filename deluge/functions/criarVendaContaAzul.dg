@@ -11,6 +11,10 @@
 //        estágio "Negotiation/Review" e envia e-mail de alerta.
 //   4. Busca o cliente no Conta Azul pelo CNPJ (documento). Se não existir, cria
 //      um novo cliente (pessoa jurídica) com os dados de endereço da Account.
+//      - Se a busca/criação não retornar um id de cliente válido (ex: a API
+//        de criação rejeitou os dados), bloqueia a venda aqui mesmo, com uma
+//        mensagem clara - em vez de deixar a criação da venda falhar lá na
+//        frente com o erro genérico "O campo 'id_cliente' é obrigatório".
 //   5. Percorre o subform de produtos do Deal (Produtos_API), localizando cada
 //      item no Conta Azul pelo SKU/código do produto (Product_Code no Zoho).
 //      - Produtos não encontrados no Conta Azul bloqueiam a venda e disparam
@@ -113,6 +117,27 @@ try
 					headers:headerMap
 				];
 				idCliente = respostaCriarCliente.get("id");
+			}
+			// ===== BLOQUEIO: cliente sem id (busca ou criação falhou/retornou
+			// formato inesperado) - sem isso, o código seguia até tentar criar a
+			// venda com "id_cliente" vazio, e só quebrava lá na Conta Azul com um
+			// erro genérico e confuso ("O campo 'id_cliente' é obrigatório"). =====
+			if(idCliente == null || idCliente == "")
+			{
+				mensagemErro = "❌ CLIENTE NÃO OBTIDO NO CONTA AZUL: não foi possível obter o id do cliente para a conta '" + accountMap.get("Account_Name") + "' (CNPJ " + cnpjLimpo + "). Venda NÃO criada.";
+				mapaErro = Map();
+				mapaErro.put("Status_ContaAzul_Detalhe",mensagemErro);
+				mapaErro.put("Stage","Negotiation/Review");
+				zoho.crm.updateRecord("Deals",dealId,mapaErro);
+				sendmail
+				[
+					from :zoho.loginuserid
+					to :"importnovello@gmail.com"
+					subject :"Venda NÃO criada no Conta Azul - cliente não encontrado/criado - " + dealMap.get("Deal_Name")
+					message :mensagemErro + "\n\nConfira se o CNPJ está correto e se a Conta Azul aceitou os dados de endereço da Conta. Reprocesse o negócio depois de corrigir."
+				]
+				resultadoFinal = mensagemErro;
+				return resultadoFinal;
 			}
 			itensSubform = dealMap.get("Produtos_API");
 			listaItensVenda = List();
