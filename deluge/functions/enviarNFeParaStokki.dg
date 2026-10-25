@@ -65,7 +65,7 @@ arquivoXml.setFileType("application/xml");
 // =====================================
 // 2. ENVIAR PARA O SUPABASE
 // =====================================
-supabaseUrl = "https://kxnrhpbzbiyvwnuluffe.supabase.co";
+supabaseUrl = "https://seuprojetoexemplo.supabase.co";
 serviceRoleKey = "{{SUPABASE_SERVICE_ROLE_KEY}}"; // REDIGIDO - buscar de Connection/Variável segura
 bucket = "nfe-xml";
 headerSupabase = Map();
@@ -96,7 +96,7 @@ info urlPublica;
 // 3. ENVIAR PARA O STOKKI
 // =====================================
 tokenStokki = "{{STOKKI_TOKEN}}"; // REDIGIDO - buscar de Connection/Variável segura
-subdominioStokki = "novellohuaxin";
+subdominioStokki = "suaempresa";
 // ex: suaempresa
 urlStokki = "https://" + subdominioStokki + ".stokki.com.br/api/stokki/oms/outbound/invoice";
 bodyStokki = Map();

@@ -36,7 +36,7 @@ string automation.renovarTokenContaAzul()
 {
 clientId = "{{CONTAAZUL_CLIENT_ID}}"; // REDIGIDO - buscar de Connection/Variável segura
 clientSecret = "{{CONTAAZUL_CLIENT_SECRET}}"; // REDIGIDO - buscar de Connection/Variável segura
-contaConfigId = "7485108000000836001";
+contaConfigId = "1234567000000000001";
 // Conta "CONFIG - INTEGRACOES"
 contaMap = zoho.crm.getRecordById("Accounts",contaConfigId);
 refreshToken = contaMap.get("ContaAzul_Refresh_Token");

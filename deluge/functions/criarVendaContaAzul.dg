@@ -72,7 +72,7 @@ try
 			sendmail
 			[
 				from :zoho.loginuserid
-				to :"importnovello@gmail.com"
+				to :"alertas@exemplo.com.br"
 				subject :"Venda NÃO criada no Conta Azul - CNPJ ausente - " + dealMap.get("Deal_Name")
 				message :"A conta '" + accountMap.get("Account_Name") + "' vinculada ao negócio " + dealMap.get("Deal_Name") + " não possui CNPJ cadastrado.\n\nCadastre o CNPJ na Conta e reprocesse o negócio (edite qualquer campo e salve novamente). O negócio foi devolvido para o estágio anterior."
 			]
@@ -132,7 +132,7 @@ try
 				sendmail
 				[
 					from :zoho.loginuserid
-					to :"importnovello@gmail.com"
+					to :"alertas@exemplo.com.br"
 					subject :"Venda NÃO criada no Conta Azul - cliente não encontrado/criado - " + dealMap.get("Deal_Name")
 					message :mensagemErro + "\n\nConfira se o CNPJ está correto e se a Conta Azul aceitou os dados de endereço da Conta. Reprocesse o negócio depois de corrigir."
 				]
@@ -193,7 +193,7 @@ try
 				sendmail
 				[
 					from :zoho.loginuserid
-					to :"importnovello@gmail.com"
+					to :"alertas@exemplo.com.br"
 					subject :"Venda NÃO criada no Conta Azul - " + dealMap.get("Deal_Name")
 					message :mensagemErro + "\n\nCadastre o(s) produto(s) no Conta Azul e reprocesse o negócio."
 				]
@@ -305,7 +305,7 @@ catch (e)
 	sendmail
 	[
 		from :zoho.loginuserid
-		to :"importnovello@gmail.com"
+		to :"alertas@exemplo.com.br"
 		subject :"ERRO ao criar venda no Conta Azul - Deal " + dealId
 		message :"Erro capturado: " + e
 	]

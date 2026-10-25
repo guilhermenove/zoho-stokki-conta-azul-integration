@@ -72,8 +72,8 @@ try
 	if(!jaEnviadoStokki)
 	{
 		stokkiToken = "{{STOKKI_TOKEN}}"; // REDIGIDO - buscar de Connection/Variável segura
-		stokkiUrlPedido = "https://novellohuaxin.stokki.com.br/api/stokki/oms/outbound/store";
-		stokkiUrlEstoque = "https://novellohuaxin.stokki.com.br/api/stokki/oms/inventory/show";
+		stokkiUrlPedido = "https://suaempresa.stokki.com.br/api/stokki/oms/outbound/store";
+		stokkiUrlEstoque = "https://suaempresa.stokki.com.br/api/stokki/oms/inventory/show";
 		accountId = dealMap.get("Account_Name");
 		if(accountId == null)
 		{
@@ -127,7 +127,7 @@ try
 				sendmail
 				[
 					from :zoho.loginuserid
-					to :"importnovello@gmail.com"
+					to :"alertas@exemplo.com.br"
 					subject :"Negócio incompleto - Nada foi enviado - " + dealMap.get("Deal_Name")
 					message :"O negócio " + dealMap.get("Deal_Name") + " foi marcado como Ganho, mas os seguintes campos obrigatórios estão vazios:\n\n" + mensagensErro.toString() + "\n\nPreencha e reprocesse o negócio (edite qualquer campo e salve novamente). O negócio foi devolvido para o estágio anterior."
 				]
@@ -196,7 +196,7 @@ try
 					sendmail
 					[
 						from :zoho.loginuserid
-						to :"importnovello@gmail.com"
+						to :"alertas@exemplo.com.br"
 						subject :"Pedido NÃO enviado (Stokki + Conta Azul) - " + dealMap.get("Deal_Name")
 						message :"O negócio " + dealMap.get("Deal_Name") + " foi marcado como Ganho, mas NADA foi enviado (nem Stokki, nem Conta Azul) por causa de:\n\n" + mensagensErro.toString() + "\n\nO negócio foi devolvido para o estágio anterior."
 					]
@@ -246,7 +246,7 @@ try
 						carrier = Map();
 						carrier.put("name",transportadora);
 						carrier.put("company_name",transportadora);
-						carrier.put("cnpj","35149864000153");
+						carrier.put("cnpj","11222333000181");
 						carrier.put("street","Gen. Mário Tourinho");
 						carrier.put("city","Curitiba");
 						carrier.put("state","PR");
@@ -305,7 +305,7 @@ catch (e)
 	sendmail
 	[
 		from :zoho.loginuserid
-		to :"importnovello@gmail.com"
+		to :"alertas@exemplo.com.br"
 		subject :"ERRO na integração - Deal " + dealId
 		message :"Erro capturado: " + e
 	]
